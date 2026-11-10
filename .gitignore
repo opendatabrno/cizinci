@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+~$*
+
+# zdrojová data MV stahuje stahni_data.py
+/data/
+# xlsx kopie výstupů, v repu jsou jen CSV
+/vystup/*.xlsx
+# přehled kontrol generuje kontrola.py
+/vystup/kontrola.html
+_site/
+/vystup/kontrola_souhrn.md
+/vystup/kontrola_stav.txt
+/vystup/chyba_struktury.txt

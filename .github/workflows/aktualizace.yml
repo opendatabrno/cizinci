@@ -1,0 +1,129 @@
+# Hlídá stránky MV, stáhne nové měsíční soubory (roční sady z prosincových), zpracuje je
+# a výsledek pošle jako pull request.
+# Když soubor MV změní strukturu a parser ho nepřečte, založí issue s popisem souboru.
+name: Aktualizace dat MV
+
+on:
+  schedule:
+    - cron: "17 5 * 1-2 *"    # leden–únor denně (MV zveřejňuje stav k 31. 12. obvykle koncem ledna)
+    - cron: "17 5 * 3-12 1"   # zbytek roku každé pondělí (nový měsíční soubor)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: aktualizace-dat
+  cancel-in-progress: false
+
+jobs:
+  aktualizace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # zdrojové Excely nejsou v repozitáři; cache drží už stažené, stahují se jen nové
+      - name: Obnovení stažených souborů MV
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: data-mv-cizinci-${{ github.run_id }}
+          restore-keys: data-mv-cizinci-
+
+      - name: Stažení souborů MV a číselníku okresů
+        run: python stahni_data.py
+
+      - name: Uložení stažených souborů MV
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: data-mv-cizinci-${{ github.run_id }}
+
+      - name: Zpracování
+        id: zpracovani
+        continue-on-error: true
+        run: python zpracuj_data.py
+
+      - name: Issue – nerozpoznaná struktura souboru
+        if: steps.zpracovani.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const cesta = 'vystup/chyba_struktury.txt';
+            const detail = fs.existsSync(cesta)
+              ? fs.readFileSync(cesta, 'utf8')
+              : 'Zpracování selhalo z jiného důvodu než struktura souboru, viz log běhu.';
+            const behu = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const telo = [
+              'Automatická aktualizace nedokázala zpracovat soubory MV.',
+              'Nejspíš se změnil formát nebo struktura souboru – parser je potřeba upravit',
+              '(`zpracuj_data.py`).',
+              '',
+              `Běh: ${behu}`,
+              '',
+              '```',
+              detail.slice(0, 60000),
+              '```',
+            ].join('\n');
+            const stitek = 'zmena-struktury';
+            const otevrene = await github.rest.issues.listForRepo({
+              ...context.repo, state: 'open', labels: stitek,
+            });
+            if (otevrene.data.length) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: otevrene.data[0].number, body: telo,
+              });
+            } else {
+              await github.rest.issues.create({
+                ...context.repo, title: 'Změna struktury souborů MV – nutná úprava zpracování',
+                body: telo, labels: [stitek],
+              });
+            }
+            core.setFailed('Zpracování selhalo, založeno issue.');
+
+      - name: Přehled kontrol jako artefakt
+        if: steps.zpracovani.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kontrola
+          path: vystup/kontrola.html
+
+      - name: Text pull requestu
+        if: steps.zpracovani.outcome == 'success'
+        id: pr
+        run: |
+          stav=$(cat vystup/kontrola_stav.txt)
+          mesic=$(tail -n 1 vystup/kontrola_souctu.csv | cut -d, -f3)
+          {
+            cat vystup/kontrola_souhrn.md
+            echo
+            echo "Přehled kontrol: artefakt **kontrola** v [běhu workflow](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+            echo
+            echo "Před sloučením projdi přehled kontrol a změny v CSV."
+          } > "$RUNNER_TEMP/pr.md"
+          if [ "$stav" = "chyba" ]; then predpona="⚠️ Kontrola nesedí – "; else predpona=""; fi
+          echo "titulek=${predpona}Aktualizace dat MV (stav k ${mesic})" >> "$GITHUB_OUTPUT"
+
+      - name: Pull request se změnami
+        if: steps.zpracovani.outcome == 'success'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: aktualizace-dat
+          delete-branch: true
+          commit-message: "Aktualizace dat MV"
+          title: ${{ steps.pr.outputs.titulek }}
+          body-path: ${{ runner.temp }}/pr.md
+          labels: aktualizace-dat
+          add-paths: |
+            vystup/*.csv
+            ciselniky/*.csv
